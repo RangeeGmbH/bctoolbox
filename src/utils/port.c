@@ -374,7 +374,10 @@ int __bctbx_WIN_mutex_init(bctbx_mutex_t *mutex, void *attr) {
 
 int __bctbx_WIN_mutex_lock(bctbx_mutex_t *hMutex) {
 #ifdef BCTBX_WINDOWS_DESKTOP
-	WaitForSingleObject(*hMutex, INFINITE); /* == WAIT_TIMEOUT; */
+    DWORD err;
+    do {
+        err = WaitForSingleObject(*hMutex,  100);
+    } while(err == WAIT_TIMEOUT);
 #else
 	AcquireSRWLockExclusive(hMutex);
 #endif
@@ -442,7 +445,10 @@ int __bctbx_WIN_thread_create(bctbx_thread_t *th, void *attr, void *(*func)(void
 
 int __bctbx_WIN_thread_join(bctbx_thread_t thread_h, void **unused) {
 	if (thread_h != NULL) {
-		WaitForSingleObjectEx(thread_h, INFINITE, FALSE);
+        DWORD err;
+        do {
+            err = WaitForSingleObject(thread_h,  100);
+        } while(err == WAIT_TIMEOUT);
 		CloseHandle(thread_h);
 	}
 	return 0;
@@ -465,7 +471,10 @@ int __bctbx_WIN_cond_wait(bctbx_cond_t *hCond, bctbx_mutex_t *hMutex) {
 #ifdef BCTBX_WINDOWS_DESKTOP
 	// gulp: this is not very atomic ! bug here ?
 	__bctbx_WIN_mutex_unlock(hMutex);
-	WaitForSingleObject(*hCond, INFINITE);
+    DWORD err;
+    do {
+        err = WaitForSingleObject(*hCond,  100);
+    } while(err == WAIT_TIMEOUT);
 	__bctbx_WIN_mutex_lock(hMutex);
 #else
 	SleepConditionVariableSRW(hCond, hMutex, INFINITE, 0);
@@ -714,7 +723,10 @@ bctbx_pipe_t bctbx_server_pipe_accept_client(bctbx_pipe_t server) {
 	ConnectNamedPipe(server, &ol);
 	handles[0] = ol.hEvent;
 	handles[1] = event;
-	WaitForMultipleObjects(2, handles, FALSE, INFINITE);
+    DWORD err;
+    do {
+        err = WaitForMultipleObjects(2, handles, FALSE, 100);
+    } while(err == WAIT_TIMEOUT);
 	if (GetOverlappedResult(server, &ol, &undef, FALSE)) {
 		CloseHandle(ol.hEvent);
 		return server;
@@ -767,17 +779,83 @@ bctbx_pipe_t bctbx_client_pipe_connect(const char *name) {
 }
 
 int bctbx_pipe_read(bctbx_pipe_t p, uint8_t *buf, int len) {
-	DWORD ret = 0;
-	if (ReadFile(p, buf, len, &ret, NULL)) return ret;
-	/*bctbx_error("Could not read from pipe: %s",strerror(GetLastError()));*/
-	return -1;
+    DWORD ret = 0;
+    OVERLAPPED ol;
+    DWORD bytesRead;
+    HANDLE handles[2];
+    DWORD err;
+    memset(&ol, 0, sizeof(ol));
+    ol.hEvent = CreateEvent(NULL, TRUE, TRUE, NULL);
+    handles[0] = ol.hEvent;
+    handles[1] = event;
+    if(ReadFile(p, buf, len, &ret, &ol)) {
+        err = GetLastError();
+        GetOverlappedResult(p, &ol, &bytesRead, TRUE);
+        CloseHandle(ol.hEvent);
+        return bytesRead;
+    }
+    else {
+        err = GetLastError();
+        if(err == ERROR_BROKEN_PIPE) {
+            CloseHandle(ol.hEvent);
+            return 0;
+        }
+        if(err != ERROR_IO_PENDING) {
+            CloseHandle(ol.hEvent);
+            return -1;
+        }
+        do {
+            err = WaitForMultipleObjects(2, handles, FALSE, 100);
+        } while(err == WAIT_TIMEOUT);
+
+        if (GetOverlappedResult(p, &ol, &bytesRead, TRUE)) {
+            // success
+            CloseHandle(ol.hEvent);
+            return bytesRead;
+        }
+
+        // GetOverlappedResult() failed
+        err = GetLastError();
+        if(err == ERROR_BROKEN_PIPE){
+            // client disconnected
+            CloseHandle(ol.hEvent);
+            return 0;
+        }
+    }
+    CloseHandle(ol.hEvent);
+    return -1;
 }
 
 int bctbx_pipe_write(bctbx_pipe_t p, const uint8_t *buf, int len) {
-	DWORD ret = 0;
-	if (WriteFile(p, buf, len, &ret, NULL)) return ret;
-	/*bctbx_error("Could not write to pipe: %s",strerror(GetLastError()));*/
-	return -1;
+    DWORD ret = 0;
+    OVERLAPPED ol;
+    DWORD bytesWritten;
+    HANDLE handles[2];
+    DWORD err;
+    memset(&ol, 0, sizeof(ol));
+    ol.hEvent = CreateEvent(NULL, TRUE, TRUE, NULL);
+    handles[0] = ol.hEvent;
+    handles[1] = event;
+    if(WriteFile(p, buf, len, &ret, &ol)) {
+        CloseHandle(ol.hEvent);
+        return ERROR_SUCCESS;
+    }
+    else {
+        err = GetLastError();
+        if(err != ERROR_INVALID_HANDLE) {
+            CloseHandle(ol.hEvent);
+            return -1;
+        }
+        if(err != ERROR_IO_PENDING) {
+            CloseHandle(ol.hEvent);
+            return -1;
+        }
+        do {
+            err = WaitForMultipleObjects(2, handles, FALSE, 100);
+        } while(err == WAIT_TIMEOUT);
+    }
+    CloseHandle(ol.hEvent);
+    return -1;
 }
 
 int bctbx_client_pipe_close(bctbx_pipe_t sock) {
